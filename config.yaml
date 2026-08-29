@@ -1,0 +1,696 @@
+# ── Fournisseurs de modeles ───────────────────────────────────────────
+# Bloc TOP-LEVEL lu en priorite par le resolveur (runtime_provider.py:711).
+# La cle vient de .env via key_env — aucun secret ici.
+providers:
+  # Retenu le 2026-08-22 apres l echec definitif du tier gratuit Groq
+  # (8 000 tokens/minute, alors que le seul socle de TACZET en pese 28 000).
+  # OpenRouter : aucun plafond de credit, pas de limite par minute bloquante,
+  # contextes de 262 000 a 2 000 000 tokens.
+  openrouter:
+    name: OpenRouter
+    base_url: "https://openrouter.ai/api/v1"
+    key_env: "OPENROUTER_API_KEY"
+    default_model: "dots-studio/dots-3-note-preview:free"
+  # Conserve pour memoire : inutilisable en tier gratuit, garde au cas ou
+  # Isaac passerait un jour au Dev Tier.
+  groq:
+    name: Groq
+    base_url: "https://api.groq.com/openai/v1"
+    key_env: "GROQ_API_KEY"
+    default_model: "openai/gpt-oss-120b"
+
+# ── Cerveau ───────────────────────────────────────────────────────────
+# Bascule sur Groq le 2026-08-13, decidee par Isaac sur mesure comparative
+# (meme prompt, meme schema d'outil, instruction "Ouvrez YouTube") :
+#   upstage/solar-pro4:free  -> 71 s, AUCUN appel d'outil
+#   llama-3.3-70b-versatile  -> 0,42 s, appelle terminal("Start-Process <url>")
+# Le 70B est prefere au 8B-instant : ce dernier codait Chrome en dur, ce qui
+# contournerait Opera GX. Retour arriere = provider: nous + l'ancien modele.
+model:
+  # 2026-08-22 : llama-3.3-70b-versatile a DISPARU du catalogue Groq (HTTP 404
+  # "model does not exist"). Toute la famille Llama est partie. Remplace par
+  # gpt-oss-120b, mesure a 0,41 s avec appel d outil correct.
+  # NE PAS utiliser allam-2-7b, groq/compound ni compound-mini : ils ne
+  # supportent PAS le tool calling (400 "tool calling is not supported").
+  # Mesure le 22/08 : 1,30 s, appel d outil correct 3 fois sur 3,
+  # contexte 512 000. Ecartes : les Gemma (429 des le 2e essai), les
+  # thinkingmachines (403), laguna-xs (10 s), nemotron (n appelle pas d outil).
+  default: dots-studio/dots-3-note-preview:free
+  provider: openrouter
+  base_url: ''
+  # Declare explicitement : le cache (context_length_cache.yaml) ne connait pas
+  # ce modele, et sans cette valeur Hermes retombe sur 256 000 tokens supposes
+  # (voir les avertissements "Could not determine context length" dans errors.log).
+  # Il ne declencherait alors la compression qu'a ~128 000 tokens, bien au-dela
+  # de ce qui est utile. Le modele accepte 512 000, mais laisser gonfler la
+  # session la rendrait lente sans aucun benefice.
+  #
+  # CORRIGE le 2026-08-26. Ce commentaire affirmait que la compression se
+  # declenche a 32 000 (soit 50 % de 64 000), « juste au-dessus du socle ».
+  # C'est FAUX : deux garde-fous d'Hermes interviennent avant.
+  #
+  #   50 % de 64 000                      = 32 000
+  #   plancher MINIMUM_CONTEXT_LENGTH     = max(32 000, 64 000) = 64 000
+  #   ce plancher egale la fenetre entiere -> la compression ne pourrait
+  #   JAMAIS se declencher, le fournisseur refusant la requete avant 100 %.
+  #   Hermes detecte ce cas degenere et bascule sur _MIN_CTX_TRIGGER_RATIO,
+  #   soit 85 % : declenchement reel a 54 400 tokens.
+  #
+  # Marge de conversation reelle : 54 400 - 31 358 (socle mesure) = 23 042
+  # tokens, et non les 642 que le calcul naif laissait craindre.
+  # Verifie en appelant _compute_threshold_tokens, pas en lisant la doc.
+  #
+  # A SURVEILLER : apres declenchement il ne reste que 9 600 tokens de
+  # fenetre. Si la compression ne recupere pas assez, elle pourrait se
+  # rappeler souvent. Jamais observe — ne pas corriger d'avance.
+  context_length: 64000
+
+# ── Taches auxiliaires (titres de session, resumes, compression) ──────
+# free_only: true est INDISPENSABLE depuis la bascule OpenRouter.
+# Par defaut Hermes autorise un repli auxiliaire vers un modele PAYANT
+# (observe le 22/08 : "PAID lane engaged ... google/gemini-3.6-flash is not
+# a :free SKU and may incur real spend"). Isaac n a jamais autorise de
+# depense : on restreint les auxiliaires aux modeles gratuits.
+auxiliary:
+  free_only: true
+  # Sans ce modele explicite, free_only bloquait TOUT le repli auxiliaire :
+  # Hermes visait google/gemini-3.6-flash (payant), le refusait a cause de
+  # free_only, puis concluait "no usable OpenRouter credentials found".
+  # Les taches auxiliaires (titres de session, resumes) etaient donc mortes.
+  # Observe au demarrage du 22/08 a 10:21.
+  openrouter_model: "dots-studio/dots-3-note-preview:free"
+
+# ── Chaine de secours (BLUEPRINT v3 §I.5.2) ───────────────────────────
+# Essayee dans l ordre si le modele principal echoue. Motivee par un incident
+# reel : le 22/08, le modele alors en place a disparu du catalogue de son
+# fournisseur et TACZET est devenu totalement muet.
+# Les deux replis sont chez OpenRouter et appellent correctement les outils
+# (mesures du 22/08 : 1,60 s et 1,63 s).
+fallback_model:
+  - provider: openrouter
+    model: poolside/laguna-s-2.1:free
+  - provider: openrouter
+    model: google/gemma-4-31b-it:free
+database:
+  journal_mode: wal
+runtime:
+  nofile_soft_limit: 4096
+agent:
+  # 150 -> 20 le 2026-08-26. Le compte OpenRouter est sur le palier gratuit :
+  # 50 requetes de modele par JOUR, tous modeles `:free` confondus (le plafond
+  # `free-models-per-day` est attache au COMPTE, pas au modele — changer de
+  # repli n'y change rien).
+  #
+  # A 150 tours, UNE seule requete confuse pouvait consommer trois fois le
+  # quota d'une journee. Le 25/08, une demande d'agenda a coute 7 appels rien
+  # qu'a tatonner sur la syntaxe des dates.
+  #
+  # Au-dela de 20 allers-retours, une tache qui n'a pas abouti n'aboutira
+  # generalement pas.
+  #
+  # MISE A JOUR du 2026-08-26, quelques heures plus tard : Isaac a credite le
+  # compte, le palier est passe a 1000 requetes/jour (is_free_tier=False). La
+  # raison premiere de ce plafond a donc disparu. Il est MAINTENU quand meme,
+  # et volontairement : une tache qui boucle reste du gaspillage, et 20 tours
+  # n'a encore jamais tronque une tache reelle. A remonter le jour ou une
+  # tache legitime sera coupee — pas avant, par speculation.
+  max_turns: 20
+  verbose: false
+  # ── `reasoning_effort` est VOLONTAIREMENT ABSENT ────────────────────
+  # NE PAS le remettre, meme a `false` ou `none` : ces deux valeurs donnent
+  # `{'enabled': False}`, que Hermes traduit par la propriete `think` dans le
+  # corps de requete — que Groq refuse (HTTP 400 "property 'think' is
+  # unsupported", 2026-08-15). Seule l'ABSENCE de la clef donne None, qui
+  # n'envoie rien du tout. Verifie avec hermes_constants.resolve_reasoning_config.
+  # Si un modele raisonnant revient un jour, cibler ce modele precis via
+  # agent.reasoning_overrides plutot que de reintroduire la clef globale.
+  personalities: {}
+terminal:
+  backend: local
+  cwd: .
+  timeout: 180
+  home_mode: auto
+  container_cpu: 1
+  container_memory: 5120
+  container_disk: 51200
+  container_persistent: true
+  docker_mount_cwd_to_workspace: false
+  lifetime_seconds: 300
+browser:
+  backend: browser-use
+  inactivity_timeout: 120
+tool_loop_guardrails:
+  warnings_enabled: true
+  hard_stop_enabled: false
+  warn_after:
+    exact_failure: 2
+    same_tool_failure: 3
+    idempotent_no_progress: 2
+  hard_stop_after:
+    exact_failure: 5
+    same_tool_failure: 8
+    idempotent_no_progress: 5
+compression:
+  enabled: true
+  progress_notices: false
+  threshold: 0.5
+  target_ratio: 0.2
+  protect_last_n: 20
+  min_tail_user_messages: 1
+  max_attempts: 3
+  proactive_prune_tokens: 0
+  proactive_prune_min_result_chars: 8000
+  proactive_prune_min_reclaim_tokens: 4096
+  protect_first_n: 3
+  codex_gpt55_autoraise: true
+  codex_app_server_auto: native
+  codex_responses_native: false
+  codex_responses_compact_threshold: 200000
+  idle_compact_after_seconds: 0
+prompt_caching:
+  cache_ttl: 5m
+display:
+  compact: false
+  busy_input_mode: interrupt
+  bell_on_complete: false
+  show_reasoning: false
+  streaming: false
+  skin: taczet
+  interim_assistant_messages: true
+  tool_progress: all
+  cleanup_progress: false
+  long_running_notifications: true
+  busy_ack_detail: true
+  # ── Mode silencieux (2026-08-12) ────────────────────────────────────
+  # Plus de "Memory updated" dans le chat. La memoire continue de s'ecrire,
+  # seule l'annonce disparait (elle reste tracee dans stdout).
+  memory_notifications: "off"
+  # all -> error : on ne dit plus rien quand une tache de fond REUSSIT, mais
+  # on parle encore quand elle ECHOUE. Choix delibere : un echec silencieux
+  # est pire que du bruit. Mettre "off" pour le silence absolu.
+  background_process_notifications: error
+  # ── Surcharges par plateforme ────────────────────────────────────────
+  # SEUL emplacement lu par resolve_display_setting() (gateway/display_config.py:213).
+  # Une cle de display posee sous `platforms:` A LA RACINE est ignoree en silence.
+  # Discord est classe _TIER_HIGH (display_config.py:138) = le tier le plus bavard :
+  # sans ces surcharges il affiche tool_progress "all" + commentaires intermediaires.
+  platforms:
+    discord:
+      # Reactive le 2026-08-25 avec le passage au DM. "off" repondait a un
+      # salon partage ou chaque appel d'outil polluait la conversation des
+      # amis d'Isaac. En prive, l'inverse est vrai : sur une requete de
+      # vingt secondes, un signe de vie vaut mieux qu'un ecran muet.
+      # "new" = une seule bulle editee au fil des appels (grouping
+      # "accumulate" par defaut), pas un message par outil.
+      tool_progress: "new"
+      interim_assistant_messages: false  # plus de "Searching how to do it"
+      busy_ack_detail: false        # accuse de reception terse, sans compteur d'iterations
+      show_reasoning: false         # pas de raisonnement affiche
+      streaming: false              # pas d'edition progressive token par token
+      # Coupe le 2026-08-12 : plus de battement de coeur "je travaille encore".
+      # Contrepartie assumee — sur une tache longue, aucun signe de vie avant
+      # la reponse finale. C'est le prix du silence.
+      # Remis a true le 2026-08-25, meme raison : en DM, le battement de
+      # coeur "je travaille encore" est un service, plus une pollution.
+      long_running_notifications: true
+      # Plus d'accuse "Steered into current run" quand un message arrive
+      # pendant un traitement.
+      busy_steer_ack_enabled: false
+      # Efface les bulles de progression residuelles apres la reponse finale.
+      cleanup_progress: true
+stt:
+  # REACTIVEE le 2026-08-13 : Isaac veut piloter la machine a la voix.
+  # (Mise en veille le 12/08, rallumee telle quelle — VAD local intact.)
+  #
+  # ATTENTION, changement de nature du risque : une transcription n'est plus
+  # seulement affichee, elle peut DECLENCHER UNE ACTION (terminal,
+  # computer_use). Une hallucination de Whisper devient donc une commande
+  # potentielle. C'est ce qui rend le verrou de fenetre necessaire, pas
+  # seulement souhaitable.
+  # MISE EN VEILLE le 2026-08-22, a la demande d Isaac : il pilote desormais
+  # par commandes TEXTE dans le salon Discord, sans avoir a rejoindre un vocal.
+  # Ce n est PAS un correctif du 413 : une phrase vocale ne pesait que 4 tokens.
+  # Toute la chaine reste configuree (VAD, Whisper small, amorce de vocabulaire) :
+  # remettre true la reactive telle quelle.
+  enabled: false
+  # false = les transcriptions ne sont plus reemises dans le chat en message
+  # micro. La transcription CONTINUE d'alimenter l'agent — on masque seulement
+  # l'affichage. Demande d'Isaac le 2026-08-12 : plus aucune transcription.
+  # NB : si une hallucination de Whisper passe encore, tu ne la verras plus
+  # arriver ; elle se manifestera par une reponse de TACZET a rien du tout.
+  # REMIS a true le 2026-08-13. Ce n'est plus du confort d'affichage mais de
+  # la TRACABILITE : depuis que la voix declenche des actions, Isaac doit voir
+  # ce que TACZET a entendu avant de le voir agir — sinon une action
+  # inexpliquee est indechiffrable.
+  echo_transcripts: true
+  # fr — Isaac parle francais. Le defaut amont est "en" et s'applique a TOUS
+  # les providers : Whisper transcrivait donc le francais en supposant de
+  # l'anglais, ce qui degrade fortement le resultat. Corrige le 2026-08-12.
+  language: fr
+  # Groq retenu le 2026-08-12 : Isaac veut la latence minimale.
+  # Transcription hebergee (~300-800 ms) contre ~1-3 s pour le local sur son
+  # i5 sans GPU. Necessite GROQ_API_KEY dans .env — sans la cle, ca echoue.
+  # Repli disponible a tout moment : remettre provider: local (faster_whisper
+  # reste installe, aucune desinstallation faite).
+  # ── RETOUR AU LOCAL le 2026-08-12 — decision fondee sur les logs ─────
+  # Groq avait ete choisi pour la latence. Les logs du 12/08 21:37-21:39
+  # montrent que le goulot n'est PAS la transcription (0,5 s) mais le modele :
+  # 10,8 s / 18,6 s / 45,7 s par reponse. Gagner 1,5 s de STT pendant que le
+  # LLM en prend 45 n'a aucun sens — surtout au prix des hallucinations.
+  # Le VAD Silero n'existe QUE sur provider: local ; c'est le SEUL mecanisme
+  # d'Hermes capable d'empecher "Sous-titrage Societe Radio-Canada".
+  # Pour revenir a Groq : provider: groq (la cle et le paquet restent en place).
+  provider: local
+  # ── Anti-hallucination (cloud, inactif tant que provider: local) ─────
+  # ATTENTION : le VAD Silero et les seuils no_speech/logprob n'existent QUE
+  # pour provider: local (config_defaults.py:1593). En cloud, le SEUL rempart
+  # est le rognage de silence ci-dessous. Sans lui, Whisper invente sur le
+  # bruit — d'ou les "Sous-titrage Societe Radio-Canada" observes le 2026-08-12.
+  cloud_trim_silence: true
+  # Defaut -40 dB. Remonte a -35 : plus de choses comptent comme du silence,
+  # donc moins de bruit atteint Whisper. Si TA PAROLE DOUCE se fait couper,
+  # redescendre vers -40. Ne pas depasser -30 sans tester.
+  cloud_trim_threshold_db: -35
+  # Defaut 300 ms conserves par pause. Reduit a 200 : moins de residu de
+  # silence expedie, tout en gardant un phrase naturel.
+  cloud_trim_keep_ms: 200
+  groq:
+    # turbo = le plus rapide des Whisper de Groq, qualite tres proche.
+    model: whisper-large-v3-turbo
+    # Redondant avec stt.language ci-dessus, mais pose explicitement pour
+    # qu'aucune ambiguite d'heritage ne fasse retomber la transcription en
+    # anglais — c'etait le defaut qui degradait tout.
+    language: fr
+  local:
+    # base -> small le 2026-08-13. `base` rendait "OK TACZET, ouvre YouTube"
+    # par "Ok, t'exedes, on va Youtube" : instruction inexploitable.
+    # `small` est nettement meilleur en francais. Cout : ~1 s de plus et un peu
+    # de RAM — negligeable face aux 65 s que met le modele a repondre.
+    # Si trop lent : revenir a `base`. Si encore imprecis : `medium`.
+    model: small
+    language: fr
+    # Amorce donnee a Whisper : elle lui souffle le vocabulaire attendu.
+    # C'est LE remede au nom propre invente "TACZET", absent de son lexique.
+    initial_prompt: "Conversation en francais avec TACZET, un assistant personnel.
+      Vocabulaire frequent : TACZET, YouTube, Discord, Opera GX, Obsidian, GitHub,
+      Network+, ouvre, lance, cherche, ferme."
+    # LE remede aux hallucinations : le silence n'atteint jamais Whisper.
+    vad: true
+    vad_min_silence_ms: 500
+    # Les deux seuils doivent etre franchis ENSEMBLE pour jeter un segment.
+    # Legerement durcis par rapport aux defauts (0.6 / -1.0) pour attraper
+    # les artefacts type "Merci." et "Sous-titrage ...".
+    no_speech_prob_threshold: 0.5
+    logprob_threshold: -0.8
+    # Libere le modele apres 5 min d'inactivite — la RAM est la ressource
+    # critique sur cette machine (8 Go).
+    unload_after_idle_seconds: 300
+  openai:
+    model: whisper-1
+    language: ''
+
+# ── Voix : pas d'audio spontane ───────────────────────────────────────
+# auto_tts false = TACZET ne synthetise jamais de lui-meme. Quand il n'est PAS
+# connecte a un salon vocal, un TTS declenche partirait en FICHIER JOINT dans
+# le salon texte (adapter.py:3771) — exactement ce qu'Isaac ne veut plus.
+voice:
+  auto_tts: false
+
+# ── Synthese vocale (BLUEPRINT §2) ────────────────────────────────────
+# edge = gratuit, faible latence, deja installe (paquet edge_tts present).
+# C'est deja le defaut amont, explicite ici pour ne pas dependre d'un defaut.
+# Voix multilingue choisie a dessein : TACZET prononce en permanence des
+# termes techniques anglais (Network+, subnet, gateway...) qu'une voix
+# purement francaise estropie. Alternative regionale : fr-CA-ThierryNeural.
+tts:
+  provider: edge
+  edge:
+    # Voix masculine grave et posee. Choisie pour EVOQUER le registre froid
+    # demande par Isaac, sans imiter la voix d'une personne reelle.
+    # Voix "Multilingual" = generation la plus recente d'Edge, prosodie
+    # nettement plus naturelle que les Neural classiques.
+    voice: fr-FR-RemyMultilingualNeural
+    # Vitesse normale. Le 0.92 precedent etait la cause principale du rendu
+    # robotique : ralentir une synthese ne la rend pas posee, elle la rend
+    # artificielle. Alternatives testees : fr-FR-HenriNeural (plus grave),
+    # fr-CA-ThierryNeural (accent regional).
+    speed: 1.0
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  # Releves le 2026-08-19 apres le test 6 du blueprint v3.
+  # A 2200/1375, MEMORY.md etait a 1518 % et USER.md a 413 % : toute
+  # tentative d ecriture echouait, et jusqu a 3 consolidations par tour
+  # etaient gaspillees. La memoire etait de fait en LECTURE SEULE.
+  # Ces valeurs laissent une marge d ecriture reelle apres condensation.
+  memory_char_limit: 9000
+  user_char_limit: 8000
+  nudge_interval: 10
+  flush_min_turns: 6
+delegation:
+  max_iterations: 50
+skills:
+  creation_nudge_interval: 15
+kanban:
+  review_dispatch: true
+code_execution:
+  timeout: 300
+  max_tool_calls: 50
+streaming:
+  enabled: false
+onboarding:
+  seen:
+    busy_input_prompt: true
+telemetry:
+  shared_metrics:
+    enabled: false
+updates:
+  pre_update_backup: false
+  backup_keep: 5
+  non_interactive_local_changes: stash
+_config_version: 34
+session_reset:
+  mode: none
+  idle_minutes: 1440
+  at_hour: 4
+group_sessions_per_user: true
+platform_toolsets:
+  cli:
+    - bfl
+    - browser
+    - clarify
+    - code_execution
+    - computer_use
+    - cronjob
+    - delegation
+    - file
+    - image_gen
+    - memory
+    - session_search
+    - skills
+    - spotify
+    - terminal
+    - todo
+    - tts
+    - vision
+    - web
+  telegram:
+    - hermes-telegram
+  # ── Discord allege le 2026-08-22 ────────────────────────────────────
+  # Le preset hermes-discord exposait 25 outils, 63 692 B de schemas
+  # retraites a CHAQUE requete. Liste explicite de ce dont Isaac se sert.
+  # Retires : session_search, delegation, browser (dependances absentes,
+  # ne fonctionne pas), code_execution, tts (la voix passe par le gateway,
+  # pas par cet outil), vision.
+  # Gain mesure : 112 139 -> 88 762 B, soit -21 % par requete.
+  #
+  # NB 1 : bfl et kanban restent actives par defaut malgre leur absence
+  #        ici. Le gain supplementaire (~10 Ko) n a pas ete juge rentable.
+  # NB 2 : NE PAS utiliser `hermes tools disable` — la commande REECRIT
+  #        tout config.yaml et efface les 255 lignes de commentaires.
+  #        Editer ce bloc a la main, gateway arrete.
+  discord:
+    - web            # recherche et extraction
+    - terminal       # shell, ouverture de sites
+    - file           # lecture / ecriture
+    - computer_use   # pilotage du bureau
+    - memory         # memoire persistante
+    - todo           # taches
+    - clarify        # questions de clarification
+    - skills         # indispensable en Phase B (google-workspace est une skill)
+    - discord        # lecture du salon
+    # discord_admin retire le 2026-08-25 : la nouvelle invitation n accorde
+    # ni "Gerer les roles" ni "Gerer les messages", ces outils echoueraient
+    # cote API. Sur un serveur prive d une seule personne, ils n ont plus
+    # d objet. Le verrou taczet-approval-gate reste en place par securite.
+
+  whatsapp:
+    # Aligne sur Discord le 2026-08-26. Le prereglage d'origine
+    # `hermes-whatsapp` donnait 59 outils, dont 51 que le verrou ne voit
+    # JAMAIS : browser_exec (JavaScript arbitraire), les 18 autres outils de
+    # navigateur, cronjob, delegate_task, execute_code, la domotique Home
+    # Assistant qu'Isaac avait pourtant ecartee, la generation d'images
+    # payante et 11 outils kanban. Tout l'allegement du 25/08 n'avait porte
+    # que sur Discord ; WhatsApp etait reste la porte large.
+    #
+    # Resultat : 15 outils, dont 8 hors verrou — les memes que cote Discord
+    # (clarify, memory, todo, web_search, web_extract, skill_manage,
+    # skill_view, skills_list). Les deux portes sont desormais identiques.
+    #
+    # Pas d'equivalent WhatsApp du toolset `discord` : Hermes n'expose aucune
+    # action de plateforme pour WhatsApp. D'ou la liste de Discord moins lui.
+    - web            # recherche et extraction
+    - terminal       # shell, ouverture de sites
+    - file           # lecture / ecriture
+    - computer_use   # pilotage du bureau
+    - memory         # memoire persistante
+    - todo           # taches
+    - clarify        # questions de clarification
+    - skills         # google-workspace est une skill
+  slack:
+    - hermes-slack
+  signal:
+    - hermes-signal
+  homeassistant:
+    - hermes-homeassistant
+  qqbot:
+    - hermes-qqbot
+  yuanbao:
+    - hermes-yuanbao
+  teams:
+    - hermes-teams
+  google_chat:
+    - hermes-google_chat
+known_plugin_toolsets:
+  cli:
+    - a2a
+    - spotify
+known_builtin_toolsets:
+  cli:
+    - bfl
+    - browser
+    - clarify
+    - code_execution
+    - computer_use
+    - context_engine
+    - cronjob
+    - delegation
+    - discord
+    - discord_admin
+    - file
+    - homeassistant
+    - image_gen
+    - memory
+    - session_search
+    - skills
+    - spotify
+    - stt
+    - terminal
+    - todo
+    - tts
+    - video
+    - video_gen
+    - vision
+    - web
+    - x_search
+    - yuanbao
+# ── Reglages Discord ──────────────────────────────────────────────────
+# ATTENTION : ce bloc est TOP-LEVEL, volontairement HORS de `platforms:`.
+# C'est l'emplacement lu par le pont YAML->env (discord/adapter.py:9999).
+# Une clef posee sous `platforms.discord` ici serait ignoree en silence.
+discord:
+  # Depuis le 2026-08-25, Isaac parle a TACZET en MESSAGE PRIVE. En DM,
+  # l'adaptateur saute tout ce bloc de controle de salon (adapter.py:7710) :
+  # require_mention, thread_require_mention, free_response_channels et
+  # ignore_no_mention y sont donc SANS EFFET. Ils sont conserves parce
+  # qu'ils reprennent effet si un salon est utilise a nouveau. En revanche
+  # auto_thread et reactions agissent, eux, dans les deux cas.
+  #
+  # false = TACZET ne cree plus de fil et repond dans le salon courant.
+  # Defaut amont = true (adapter.py:7766, os.getenv("DISCORD_AUTO_THREAD","true")).
+  # Le pont n'ecrase pas la variable si .env la definit — elle n'y est pas.
+  auto_thread: false
+
+  # ── Mode silencieux, demande d'Isaac le 2026-08-12 ──────────────────
+  # TACZET ne parle QUE si on l'interpelle.
+  # Deja le defaut amont, pose explicitement pour ne dependre d'aucun defaut.
+  require_mention: true
+  # Exige la mention MEME dans un fil. Sans ca, tout fil ou TACZET a deja
+  # parle devient un salon ou il repond a tout (adapter.py:7749).
+  thread_require_mention: true
+  # Vide = aucun salon exempte de mention. Un ID ici rouvrirait la vanne.
+  free_response_channels: ""
+  # Silence si un autre utilisateur est mentionne mais pas TACZET.
+  ignore_no_mention: true
+  # Retire les reactions emoji (regard, coche, croix) posees sur les messages
+  # pendant le traitement — le "cote interactif" qu'Isaac veut supprimer.
+  reactions: false
+
+platforms:
+  discord:
+    enabled: true
+    # Point d'attache : la ou TACZET ecrit DE LUI-MEME (taches planifiees de
+    # la Phase C, notifications). Pointait jusqu'au 2026-08-25 sur un salon
+    # du serveur « <SERVEUR-PARTAGE> », quitte depuis — les envois spontanes seraient
+    # partis dans le vide. C'est desormais la conversation privee d'Isaac.
+    home_channel:
+      platform: discord
+      chat_id: '<ID-CONVERSATION-PRIVEE>'
+      name: 'DM Isaac'
+      # thread_id retire le 2026-08-12 : le fil <ID> a ete
+      # supprime cote Discord et renvoyait 404 Unknown Channel a chaque envoi
+      # spontane. Sans fil, TACZET poste directement dans le salon — coherent
+      # avec auto_thread: false. Ne pas le remettre.
+      user_id: '<ID-UTILISATEUR-DISCORD>'
+      # scope_id VOLONTAIREMENT ABSENT. Il cadre la livraison sur un serveur
+      # (gateway/delivery.py:551) ; un message prive n'appartient a aucun
+      # serveur. Le champ est Optional et n'est ajoute aux metadonnees que
+      # s'il est renseigne (gateway/config.py:507) : l'omettre est la forme
+      # correcte, pas un oubli. Ne pas y remettre l'ancien identifiant.
+    # ── Menu des commandes slash (2026-08-12) ─────────────────────────
+    # false = les 28 commandes disparaissent du menu Discord (adapter.py:1113,
+    # booleen global : aucun filtrage individuel n'existe dans Hermes).
+    # RIEN N'EST PERDU : toute commande reste utilisable en la TAPANT en texte
+    # — le gateway detecte les messages commencant par "/" (base.py:2379) et
+    # les route hors du chemin de l'agent (run.py:26674).
+    # Essentielles a retenir : /stop  /new  /sethome  /status
+    slash_commands: false
+    # `tool_progress` a ete retire d'ici : cet emplacement n'est JAMAIS lu
+    # (resolve_display_setting, display_config.py:213). Le reglage effectif
+    # vit desormais sous display.platforms.discord.
+  whatsapp:
+    enabled: true
+    # Coupe les avis « Gateway shutting down / online » sur WhatsApp
+    # (2026-08-26). Ils partent par DEUX chemins, tous deux gardes par cette
+    # meme clef : les sessions actives (run.py:9696) et le salon d'attache
+    # (run.py:9785).
+    #
+    # WhatsApp est le fil d'Isaac avec lui-meme : un avis d'exploitation y est
+    # du bruit pur. Volontairement LAISSE ACTIF sur Discord, ou il apprend
+    # quelque chose d'utile — qu'un redemarrage a interrompu une demande en
+    # cours.
+    gateway_restart_notification: false
+    # Couche 2 (runner) : aucune reponse aux non-autorises, jamais de code d'appairage.
+    unauthorized_dm_behavior: ignore
+    # Couche 1 (adaptateur) : un inconnu est rejete AVANT l'intake du gateway.
+    # NB: ne jamais definir allow_from ici — une cle presente (meme vide) prime
+    # sur WHATSAPP_ALLOWED_USERS et couperait Isaac lui-meme.
+    dm_policy: allowlist
+    group_policy: disabled
+
+# ── Dashboard web ─────────────────────────────────────────────────────
+# Theme sur mesure defini dans dashboard-themes/taczet.yaml (dossier
+# utilisateur : survit aux `hermes update`). Le selecteur de palette du
+# dashboard reecrit cette clef quand tu changes de theme a la souris.
+dashboard:
+  theme: taczet
+
+# ── Verrou d'approbation TACZET (BLUEPRINT §4) ────────────────────────
+# Refuse les actions Discord irreversibles avant execution. Approuve par
+# Isaac le 2026-08-12. Script : hooks/taczet-approval-gate.py
+#
+# `matcher` est un regex fullmatch sur le nom de l'outil : le hook ne se
+# declenche QUE sur discord_admin. C'est ce qui rend `fail_closed: true`
+# sur : un plantage du script bloque cet outil seul, pas tout TACZET.
+#
+# Deblocage = jeton a usage unique depose depuis le TERMINAL dans
+# hooks/taczet-approval-token.json. Jamais depuis Discord.
+# ── Livraison des taches planifiees (2026-08-26) ────────────────────
+# false = le contenu est livre nu. Le defaut amont enveloppe chaque reponse
+# de « Cronjob Response: <nom> », de l identifiant du job, d un separateur,
+# et d un pied de page.
+#
+# Ce pied de page est de surcroit DEVENU FAUX le 25/08 : il invite a ecrire
+# « stop reminder <nom> » a TACZET, alors que le CLI `hermes` est passe dans
+# le noyau — TACZET ne peut plus gerer les taches, Isaac le fait au terminal.
+# Une consigne qui envoie l utilisateur dans le mur vaut moins que rien.
+#
+# Contrepartie assumee : le nom de la tache disparait du message. Les deux
+# rappels de 20 h portent le meme contenu sur deux plateformes, et le texte
+# se suffit a lui-meme.
+cron:
+  wrap_response: false
+
+hooks:
+  pre_tool_call:
+    - matcher: "discord_admin"
+      command: '"C:\Users\<UTILISATEUR>\AppData\Local\hermes\hermes-agent\venv\Scripts\python.exe"
+        "C:\Users\<UTILISATEUR>\AppData\Local\hermes\hooks\taczet-approval-gate.py"'
+      timeout: 10
+      fail_closed: true
+
+    # ── Verrou de controle machine — approuve par Isaac le 2026-08-13 ──
+    # Fenetre d'autorisation ouverte depuis le TERMINAL :
+    #   powershell -File %LOCALAPPDATA%\hermes\hooks\taczet-control.ps1 open 15
+    # Hors fenetre : shell, ecriture fichier, execution de code et pilotage du
+    # bureau sont refuses. Les actions de LECTURE de computer_use (capture,
+    # list_apps, list_windows) restent libres — alignees sur _SAFE_ACTIONS
+    # d'Hermes (tools/computer_use/tool.py:81).
+    # Necessaire car sans callback CLI, l'approbation native de computer_use
+    # renvoie "autorise" par defaut sur le gateway (tool.py:534).
+    # read_file et search_files sont dans le matcher UNIQUEMENT pour que le
+    # noyau protege (.env, config.yaml, SOUL.md, hooks/) soit inaccessible en
+    # lecture. Toute autre lecture est autorisee immediatement par le script.
+    # `skill_manage` ajoute le 2026-08-26, a l issue de l audit des outils que
+    # le verrou ne voyait pas. Une skill est du TEXTE QUE LE MODELE LIT ET
+    # SUIT : en ecrire une revient a se donner des consignes permanentes,
+    # fonctionnellement un amendement a SOUL.md — lequel est dans le noyau
+    # precisement pour empecher ca. Et SOUL.md ligne 64 dit « Reactif, jamais
+    # a l initiative » : s ecrire des consignes durables EST une initiative.
+    #
+    # Hermes laisse pourtant son propre garde-fou (skills.guard_agent_created)
+    # desactive, et sa raison est explicite dans le code : « the agent can
+    # already execute the same code paths via terminal() with no gate ». Cette
+    # hypothese est FAUSSE ici — terminal() est verrouille depuis le 13/08.
+    # Un defaut amont justifie par une hypothese que notre configuration
+    # invalide.
+    - matcher: "terminal|process|write_file|patch|execute_code|computer_use|read_file|search_files|skill_manage"
+      command: '"C:\Users\<UTILISATEUR>\AppData\Local\hermes\hermes-agent\venv\Scripts\python.exe"
+        "C:\Users\<UTILISATEUR>\AppData\Local\hermes\hooks\taczet-control-gate.py"'
+      timeout: 10
+      fail_closed: true
+
+# Le gateway tourne en non-TTY : sans ceci, le prompt de consentement ne
+# peut pas s'afficher, le hook ne s'enregistre pas, et le verrou serait
+# SILENCIEUSEMENT INACTIF. Verifier apres redemarrage avec `hermes hooks list`.
+hooks_auto_accept: true
+
+# ── Security ──────────────────────────────────────────────────────────
+# Secret redaction is ON by default — strings that look like API keys,
+# tokens, and passwords are masked in tool output, logs, and chat
+# responses before the model or user ever sees them. Set redact_secrets
+# to false to disable (e.g. when developing the redactor itself).
+# tirith pre-exec scanning is enabled by default when the tirith binary
+# is available. Configure via security.tirith_* keys or env vars
+# (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN).
+#
+# security:
+#   redact_secrets: true
+#   tirith_enabled: true
+#   tirith_path: "tirith"
+#   tirith_timeout: 5
+#   tirith_fail_open: true
+
+# ── Fallback Model ────────────────────────────────────────────────────
+# Automatic provider failover when primary is unavailable.
+# Uncomment and configure to enable. Triggers on rate limits (429),
+# overload (529), service errors (503), or connection failures.
+#
+# Supported providers:
+#   openrouter   (OPENROUTER_API_KEY)  — routes to any model
+#   openai-codex (OAuth — hermes auth) — OpenAI Codex
+#   nous         (OAuth — hermes auth) — Nous Portal
+#   zai          (ZAI_API_KEY)         — Z.AI / GLM
+#   kimi-coding  (KIMI_API_KEY)        — Kimi / Moonshot
+#   kimi-coding-cn (KIMI_CN_API_KEY)   — Kimi / Moonshot (China)
+#   minimax      (MINIMAX_API_KEY)     — MiniMax
+#   minimax-cn   (MINIMAX_CN_API_KEY)  — MiniMax (China)
+#   bedrock      (AWS IAM / boto3)     — AWS Bedrock (Converse API)
+#
+# For custom OpenAI-compatible endpoints, add base_url and key_env.
+#
+# fallback_model:
+#   provider: openrouter
+#   model: anthropic/claude-sonnet-4
+approvals:
+  destructive_slash_confirm: false
